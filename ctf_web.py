@@ -145,9 +145,27 @@ def parse_range(spec):
     return out
 
 
+_XOR_TABLES = {k: bytes(b ^ k for b in range(256)) for k in range(1, 256)}
+
+# EDIT HERE if a challenge genuinely needs bigger blobs run through this -- but know the
+# cost first. The derived buffers below (rot13/urldecode/reverse in particular, which are
+# near-full-size copies with no cap of their own) measurably blow up memory well beyond a
+# simple multiple of the input size: confirmed in testing that a 25MB input drove this
+# process to 2.3GB RSS, and 50MB reliably got OOM-killed. These caps keep flag-hunting
+# usable against a real multi-MB response/file without exhausting memory mid-round.
+MAX_DECODE_SIZE = 2 << 20  # 2 MiB -- beyond this, skip ALL derived decodings (rot13,
+                            # urldecode, reverse, etc.); hunt() still pattern-matches the
+                            # raw bytes directly, so a plaintext/unencoded flag still hits
+MAX_XOR_SIZE = 1 << 16      # 64 KiB -- single-byte XOR brute force (255 full-size passes)
+                            # stays fast under this; for a bigger suspect blob, carve out
+                            # just that region first and XOR-brute-force the smaller piece
+
+
 def try_decodings(blob):
     """Yield (name, decoded_bytes) for each cheap decoding that succeeds."""
     t = bytes(blob).strip()
+    if len(t) > MAX_DECODE_SIZE:
+        return  # too large to safely fan out -- see MAX_DECODE_SIZE above
     attempts = {
         # TODO: add custom decodings here (e.g. base85, zlib, gzip, custom alphabet)
         "base64": lambda: base64.b64decode(t + b"=" * (-len(t) % 4)),
@@ -168,12 +186,14 @@ def try_decodings(blob):
                         yield f"{name}>xor_0x{k:02x}", out.translate(_XOR_TABLES[k])
         except Exception:
             continue
-    if len(t) <= 1 << 20:
+    if len(t) <= MAX_XOR_SIZE:
         for k in range(1, 256):  # single-byte XOR (translate = fast C loop)
             yield f"xor_0x{k:02x}", t.translate(_XOR_TABLES[k])
 
 
-_XOR_TABLES = {k: bytes(b ^ k for b in range(256)) for k in range(1, 256)}
+def _hunt_sources(blob):
+    yield "raw", blob
+    yield from try_decodings(blob)
 
 
 def hunt(data, flag_re, label=""):
@@ -183,7 +203,7 @@ def hunt(data, flag_re, label=""):
         return
     pat = re.compile(to_bytes(flag_re))
     seen = set()
-    for name, buf in [("raw", blob), *try_decodings(blob)]:
+    for name, buf in _hunt_sources(blob):
         for m in pat.finditer(buf):
             hit = (name, m.group(0))
             if hit not in seen:
